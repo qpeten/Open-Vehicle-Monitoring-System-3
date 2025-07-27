@@ -53,6 +53,14 @@ modem* MyModem = NULL;
 ////////////////////////////////////////////////////////////////////////////////
 // General utility functions
 
+#define GPS_SHALL_START() \
+  (m_gps_usermode == GUM_START || (m_gps_usermode == GUM_DEFAULT && m_gps_enabled && \
+    (m_gps_parkpause <= 0 || StdMetrics.ms_v_env_parktime->AsInt() < m_gps_parkpause)))
+#define GPS_SHALL_STOP() \
+  (m_gps_usermode == GUM_STOP || (m_gps_usermode == GUM_DEFAULT && m_gps_enabled && \
+    (m_gps_parkpause > 0 && StdMetrics.ms_v_env_parktime->AsInt() >= m_gps_parkpause)))
+
+
 const char* ModemState1Name(modem::modem_state1_t state)
   {
   switch (state)
@@ -94,6 +102,7 @@ const char* ModemNetRegName(modem::network_registration_t netreg)
     default:                                 return "Unknown";
     };
   }
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // The modem task itself.
@@ -305,7 +314,10 @@ modem::modem(const char* name, uart_port_t uartnum, int baud, int rxpin, int txp
   m_err_driver_buffer_full = 0;
   m_nmea = NULL;
   m_gps_enabled = false;
-  m_gps_usermode = -1;
+  m_gps_usermode = GUM_DEFAULT;
+  m_gps_parkpause = 0;
+  m_gps_stopticker = 0;
+  m_gps_startticker = 0;
   m_mux = NULL;
   m_ppp = NULL;
   m_driver = NULL;
@@ -319,6 +331,10 @@ modem::modem(const char* name, uart_port_t uartnum, int baud, int rxpin, int txp
   using std::placeholders::_2;
   MyEvents.RegisterEvent(TAG, "ticker.1", std::bind(&modem::Ticker, this, _1, _2));
   MyEvents.RegisterEvent(TAG, "system.shuttingdown", std::bind(&modem::EventListener, this, _1, _2));
+  MyEvents.RegisterEvent(TAG, "vehicle.on", std::bind(&modem::EventListener, this, _1, _2));
+  MyEvents.RegisterEvent(TAG, "vehicle.off", std::bind(&modem::EventListener, this, _1, _2));
+  MyEvents.RegisterEvent(TAG, "system.modem.gpsstop", std::bind(&modem::EventListener, this, _1, _2));
+  MyEvents.RegisterEvent(TAG, "system.modem.gotgps", std::bind(&modem::EventListener, this, _1, _2));
   MyEvents.RegisterEvent(TAG, "config.mounted", std::bind(&modem::ConfigChanged, this, _1, _2));
   MyEvents.RegisterEvent(TAG, "config.changed", std::bind(&modem::ConfigChanged, this, _1, _2));
   ConfigChanged("config.mounted", NULL);
@@ -648,7 +664,8 @@ void modem::State1Enter(modem_state1_t newstate)
 
     case NetWait:
       MyEvents.SignalEvent("system.modem.netwait", NULL);
-      StartNMEA();
+      if (GPS_SHALL_START())
+        StartNMEA();
       break;
 
     case NetStart:
@@ -1457,8 +1474,8 @@ void modem::StopTask()
 
 bool modem::StartNMEA()
   {
-  if ( (m_nmea == NULL) &&
-       (m_gps_usermode == 1 || (m_gps_usermode == -1 && m_gps_enabled)) )
+  OvmsMutexLock lock(&m_gps_mutex);
+  if (m_nmea == NULL)
     {
     if (!m_mux || !m_driver)
       {
@@ -1478,6 +1495,7 @@ bool modem::StartNMEA()
 
 void modem::StopNMEA()
   {
+  OvmsMutexLock lock(&m_gps_mutex);
   if (m_nmea != NULL)
     {
     if (!m_mux || !m_driver)
@@ -1563,12 +1581,32 @@ void modem::SetCellularModemDriver(const char* ModelType)
 
 void modem::Ticker(std::string event, void* data)
   {
+  // Pass ticker event to modem task:
   modem_or_uart_event_t ev;
-
   ev.event.type = TICKER1;
-
   QueueHandle_t queue = m_queue;
   if (queue) xQueueSend(queue,&ev,0);
+
+  // GPS park pause:
+  if (m_gps_stopticker > 0 && --m_gps_stopticker == 0)
+    {
+    ESP_LOGI(TAG, "Scheduled GPS stop");
+    StopNMEA();
+    }
+
+  // GPS reactivation:
+  if (m_gps_startticker > 0 && --m_gps_startticker == 0)
+    {
+    if (!m_nmea && m_gps_enabled && m_gps_usermode == GUM_DEFAULT)
+      {
+      ESP_LOGI(TAG, "Scheduled GPS start");
+      StartNMEA();
+      }
+    else
+      {
+      ESP_LOGI(TAG, "GPS reactivation requested, but not enabled or in user mode");
+      }
+    }
   }
 
 void modem::EventListener(std::string event, void* data)
@@ -1581,6 +1619,40 @@ void modem::EventListener(std::string event, void* data)
       SendSetState1(PoweringOff); // We are not in the task, so queue the state change
       }
     }
+  else if (event == "vehicle.on")
+    {
+    if (!m_nmea && m_gps_enabled && m_gps_usermode == GUM_DEFAULT)
+      {
+      ESP_LOGI(TAG, "Vehicle switched on, starting GPS");
+      StartNMEA();
+      }
+    m_gps_stopticker = 0;
+    }
+  else if (event == "vehicle.off")
+    {
+    if (m_nmea && m_gps_enabled && m_gps_usermode == GUM_DEFAULT && m_gps_parkpause > 0)
+      {
+      ESP_LOGI(TAG, "Vehicle switched off, scheduling GPS stop in %d seconds", m_gps_parkpause);
+      m_gps_stopticker = m_gps_parkpause;
+      }
+    }
+  else if (event == "system.modem.gpsstop")
+    {
+    if (m_gps_enabled && m_gps_usermode == GUM_DEFAULT && StdMetrics.ms_v_env_on->AsBool() == false)
+      {
+      ESP_LOGI(TAG, "GPS stopped by GPS pause system, restarting in %d minutes", m_gps_reactivate);
+      m_gps_startticker = m_gps_reactivate * 60; // convert minutes to seconds
+      }    
+    }
+  else if (event == "system.modem.gotgps")
+    {
+    if (m_nmea && m_gps_enabled && m_gps_usermode == GUM_DEFAULT && m_gps_parkpause > 0 && StdMetrics.ms_v_env_on->AsBool() == false)
+      {
+      m_gps_stopticker = m_gps_reactlock * 60; // default 5 minutes
+      ESP_LOGI(TAG, "GPS got fix, scheduling GPS stop in %d seconds", m_gps_stopticker);
+      }
+      
+    }
   }
 
 void modem::ConfigChanged(std::string event, void* data)
@@ -1590,20 +1662,35 @@ void modem::ConfigChanged(std::string event, void* data)
   if (!param || param->GetName() == "modem")
     {
     bool enable_gps = MyConfig.GetParamValueBool("modem", "enable.gps", false);
+    int gps_parkpause = MyConfig.GetParamValueInt("modem", "gps.parkpause", 0);
+    int gps_reactivate = MyConfig.GetParamValueInt("modem", "gps.reactivate", 0);
+    int gps_reactlock = MyConfig.GetParamValueInt("modem", "gps.reactlock", 5);
     if (event == "config.mounted")
       {
       // Init:
       m_gps_enabled = enable_gps;
+      m_gps_parkpause = gps_parkpause;
+      m_gps_reactivate = gps_reactivate;
+      m_gps_reactlock = gps_reactlock;
       }
-    else if (enable_gps != m_gps_enabled)
+    else if (enable_gps != m_gps_enabled || gps_parkpause != m_gps_parkpause)
       {
       // User changed GPS configuration; translate to status change:
-      m_gps_usermode = -1;
+      m_gps_usermode = GUM_DEFAULT;
       m_gps_enabled = enable_gps;
-      if (m_gps_enabled && !m_nmea)
+      m_gps_parkpause = gps_parkpause;
+      m_gps_reactivate = gps_reactivate;
+      m_gps_reactlock = gps_reactlock;
+      if (!m_nmea && GPS_SHALL_START())
         StartNMEA();
-      else if (!m_gps_enabled && m_nmea)
+      else if (m_nmea && GPS_SHALL_STOP())
         StopNMEA();
+      // Adjust stop ticker:
+      if (m_nmea && m_gps_enabled && StdMetrics.ms_v_env_on->AsBool() == false &&
+          StdMetrics.ms_v_env_parktime->AsInt() < m_gps_parkpause)
+        m_gps_stopticker = m_gps_parkpause - StdMetrics.ms_v_env_parktime->AsInt();
+      else
+        m_gps_stopticker = 0;
       }
     }
 
@@ -1972,7 +2059,7 @@ void modem_gps_start(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int ar
     return;
     }
 
-  MyModem->m_gps_usermode = 1;
+  MyModem->m_gps_usermode = modem::GUM_START;
   if (MyModem->StartNMEA())
     {
     writer->puts("GPS started (may take a minute to find satellites).");
@@ -1996,7 +2083,7 @@ void modem_gps_stop(int verbosity, OvmsWriter* writer, OvmsCommand* cmd, int arg
     return;
     }
 
-  MyModem->m_gps_usermode = 0;
+  MyModem->m_gps_usermode = modem::GUM_STOP;
   MyModem->StopNMEA();
   writer->puts("GPS stopped.");
   }
