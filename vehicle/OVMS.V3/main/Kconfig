@@ -542,6 +542,14 @@ config OVMS_VEHICLE_VWEUP
     help
         Enable to include support for vehicles VW e-up! (all model years), Seat Mii electric, and Skoda Citigo-e iV.
 
+config OVMS_VEHICLE_VWID3
+    bool "Include support for VW MEB vehicles"
+    default n
+    depends on OVMS
+    depends on OVMS_COMP_POLLER
+    help
+        Enable to include support for vehicles VW MEB platform vehicules. Currently only tested on a pre 2024 ID3.
+
 config OVMS_VEHICLE_MERCEDESB250E
     bool "Include support for Mercedes-Benz B250E (W242) vehicle"
     default n
